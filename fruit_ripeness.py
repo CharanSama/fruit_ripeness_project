@@ -2,354 +2,226 @@ import os
 import cv2
 import numpy as np
 
-# Use a non-GUI backend so we don't need Tk / windows
+# Use a non-GUI backend
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from skimage.metrics import structural_similarity
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
 
 
-# -------------------------
-# 1. Preprocessing
-# -------------------------
+
+# -----------------------------------------------------------
+# 1. PREPROCESSING
+# -----------------------------------------------------------
 def preprocess_image(bgr_img, save_debug=False, label="image"):
-    """
-    Resize, blur, convert to HSV, apply CLAHE.
-    Also saves intermediate images if save_debug=True.
-    """
-
-    # Make sure output folder exists
+    """Resize → Gaussian blur → HSV → CLAHE."""
     os.makedirs("outputs", exist_ok=True)
 
-    # --- Step 1: Resize ---
-    bgr_resized = cv2.resize(bgr_img, (256, 256), interpolation=cv2.INTER_AREA)
-    if save_debug:
-        cv2.imwrite(f"outputs/{label}_step_original.png", bgr_resized)
+    # Resize
+    bgr_resized = cv2.resize(bgr_img, (256, 256))
 
-    # --- Step 2: Gaussian smoothing ---
+    # Gaussian smoothing
     bgr_gaussian = cv2.GaussianBlur(bgr_resized, (5, 5), 0)
-    if save_debug:
-        cv2.imwrite(f"outputs/{label}_step_gaussian.png", bgr_gaussian)
 
-    # --- Step 3: Convert to HSV ---
+    # HSV conversion
     hsv_before = cv2.cvtColor(bgr_gaussian, cv2.COLOR_BGR2HSV)
 
-    # To *visualize HSV* we convert back to RGB after scaling channels
-    hsv_visual = cv2.cvtColor(hsv_before, cv2.COLOR_HSV2BGR)
-    if save_debug:
-        cv2.imwrite(f"outputs/{label}_step_hsv_visualized.png", hsv_visual)
-
-    # --- Step 4: CLAHE on V channel ---
+    # CLAHE on V channel
     h, s, v = cv2.split(hsv_before)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     v_eq = clahe.apply(v)
     hsv_after = cv2.merge([h, s, v_eq])
     bgr_preprocessed = cv2.cvtColor(hsv_after, cv2.COLOR_HSV2BGR)
 
-    if save_debug:
-        cv2.imwrite(f"outputs/{label}_step_preprocessed.png", bgr_preprocessed)
-
     return bgr_resized, hsv_before, hsv_after, bgr_preprocessed
 
 
 
-# -------------------------
-# 2. Feature extraction
-# -------------------------
-def extract_features(hsv_img):
+# -----------------------------------------------------------
+# 2. GAUSSIAN PYRAMID + TEXTURE FEATURES
+# -----------------------------------------------------------
+def gaussian_pyramid(img, levels=4):
+    pyr = [img]
+    temp = img.copy()
+    for _ in range(1, levels):
+        temp = cv2.pyrDown(temp)
+        pyr.append(temp)
+    return pyr
+
+
+def combine_pyramid_images(pyr, out_path):
+    """Combine 4 levels horizontally into one panel."""
+    resized = [cv2.resize(level, (256, 256)) for level in pyr]
+    panel = cv2.hconcat(resized)
+    cv2.imwrite(out_path, panel)
+    print(f"Saved combined pyramid → {out_path}")
+
+
+def laplacian_sharpness(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    return lap.var()
+
+
+
+# -----------------------------------------------------------
+# 3. FEATURE EXTRACTION
+# -----------------------------------------------------------
+def extract_hsv_features(hsv_img):
     h, s, v = cv2.split(hsv_img)
-    feats = [
+    return np.array([
         np.mean(h), np.std(h),
         np.mean(s), np.std(s),
         np.mean(v), np.std(v),
-    ]
-    return np.array(feats, dtype=np.float32)
+    ], dtype=np.float32)
 
 
-def compute_histograms(hsv_img, bins=32):
-    h, s, _ = cv2.split(hsv_img)
-
-    hist_h = cv2.calcHist([h], [0], None, [bins], [0, 180])
-    hist_s = cv2.calcHist([s], [0], None, [bins], [0, 256])
-
-    hist_h = hist_h / (hist_h.sum() + 1e-8)
-    hist_s = hist_s / (hist_s.sum() + 1e-8)
-
-    return hist_h, hist_s
+def extract_texture_features(pyr):
+    sharp = [laplacian_sharpness(level) for level in pyr]
+    decay = sharp[0] - sharp[-1]  # how fast texture disappears
+    return np.array([sharp[0], sharp[1], sharp[2], sharp[3], decay], dtype=np.float32)
 
 
-# -------------------------
-# 3. Simple PSNR
-# -------------------------
-def compute_psnr(img1, img2):
-    img1 = img1.astype(np.float32)
-    img2 = img2.astype(np.float32)
 
-    mse = np.mean((img1 - img2) ** 2)
-    if mse == 0:
-        return float("inf")
-
-    PIXEL_MAX = 255.0
-    return 20 * np.log10(PIXEL_MAX / np.sqrt(mse))
+# -----------------------------------------------------------
+# 4. CLASSIFIER
+# -----------------------------------------------------------
+def classify_nearest(feat, all_features, labels):
+    d = np.linalg.norm(all_features - feat, axis=1)
+    return labels[np.argmin(d)]
 
 
-# -------------------------
-# 4. Nearest-neighbor "classifier"
-# -------------------------
-def classify_nearest(feature, all_features, all_labels):
-    diffs = all_features - feature
-    dists = np.linalg.norm(diffs, axis=1)
-    idx = np.argmin(dists)
-    return all_labels[idx]
 
+# -----------------------------------------------------------
+# 5. CONFUSION MATRIX PLOTTING
+# -----------------------------------------------------------
+def save_confusion_matrix(y_true, y_pred, class_names, out_path="outputs/confusion_matrix.png"):
+    cm = confusion_matrix(y_true, y_pred, labels=class_names)
 
-# -------------------------
-# 5. Visualization helpers
-# -------------------------
-def ensure_outputs_dir():
-    os.makedirs("outputs", exist_ok=True)
-
-
-def show_images(original_bgr, preprocessed_bgr, true_label, predicted_label):
-    """
-    Save original vs preprocessed image comparison to outputs/example_images.png
-    """
-    ensure_outputs_dir()
-
-    rgb_orig = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2RGB)
-    rgb_prep = cv2.cvtColor(preprocessed_bgr, cv2.COLOR_BGR2RGB)
-
-    plt.figure(figsize=(8, 4))
-
-    plt.subplot(1, 2, 1)
-    plt.imshow(rgb_orig)
-    plt.axis("off")
-    plt.title(f"Original\nLabel: {true_label}")
-
-    plt.subplot(1, 2, 2)
-    plt.imshow(rgb_prep)
-    plt.axis("off")
-    plt.title(f"Preprocessed\nPredicted: {predicted_label}")
-
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.title("Confusion Matrix (Ripeness Classification)")
     plt.tight_layout()
-    out_path = os.path.join("outputs", "example_images.png")
-    plt.savefig(out_path, dpi=200)
+    plt.savefig(out_path)
     plt.close()
-    print(f"Saved image comparison to {out_path}")
-
-
-def show_histograms(hsv_before, hsv_after, title_prefix="Example"):
-    """
-    Save H and S histograms before and after equalization
-    to outputs/example_histograms.png
-    """
-    ensure_outputs_dir()
-
-    hist_h_before, hist_s_before = compute_histograms(hsv_before)
-    hist_h_after, hist_s_after = compute_histograms(hsv_after)
-
-    bins_h = np.arange(len(hist_h_before))
-    bins_s = np.arange(len(hist_s_before))
-
-    plt.figure(figsize=(10, 4))
-
-    plt.subplot(1, 2, 1)
-    plt.plot(bins_h, hist_h_before, label="Before")
-    plt.plot(bins_h, hist_h_after, label="After")
-    plt.title(f"{title_prefix} Hue Histogram")
-    plt.xlabel("Hue bin")
-    plt.ylabel("Normalized count")
-    plt.legend()
-
-    plt.subplot(1, 2, 2)
-    plt.plot(bins_s, hist_s_before, label="Before")
-    plt.plot(bins_s, hist_s_after, label="After")
-    plt.title(f"{title_prefix} Saturation Histogram")
-    plt.xlabel("Saturation bin")
-    plt.ylabel("Normalized count")
-    plt.legend()
-
-    plt.tight_layout()
-    out_path = os.path.join("outputs", "example_histograms.png")
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-    print(f"Saved histograms to {out_path}")
-
-def plot_feature_bars(all_data):
-    """
-    Creates a bar chart comparing mean H, S, V for each ripeness class.
-    Saves to outputs/feature_bars.png.
-    """
-    ensure_outputs_dir()
-
-    # Collect features per class
-    per_class = {}
-    for sample in all_data:
-        label = sample["label"]
-        feats = sample["features"]  # [meanH, stdH, meanS, stdS, meanV, stdV]
-        per_class.setdefault(label, []).append(feats)
-
-    # Compute average feature vector for each class
-    class_names = sorted(per_class.keys())
-    avg_feats = {}
-    for label in class_names:
-        arr = np.vstack(per_class[label])
-        avg_feats[label] = np.mean(arr, axis=0)
-
-    # We only care about meanH (0), meanS (2), meanV (4)
-    metrics_idx = [0, 2, 4]
-    metrics_names = ["Hue", "Saturation", "Value"]
-
-    x = np.arange(len(metrics_idx))  # 0,1,2
-    width = 0.25                     # bar width
-
-    plt.figure(figsize=(8, 4))
-
-    for i, label in enumerate(class_names):
-        means = [avg_feats[label][j] for j in metrics_idx]
-        plt.bar(x + i * width, means, width, label=label)
-
-    plt.xticks(x + width, metrics_names)
-    plt.ylabel("Mean channel value")
-    plt.title("Average HSV Features by Ripeness Class")
-    plt.legend()
-    plt.tight_layout()
-
-    out_path = os.path.join("outputs", "feature_bars.png")
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-    print(f"Saved feature bar chart to {out_path}")
-
-
-def plot_feature_scatter(all_data):
-    """
-    Scatter plot of mean Hue vs mean Saturation for each sample.
-    Saves to outputs/feature_scatter.png.
-    """
-    ensure_outputs_dir()
-
-    colors = {
-        "unripe": "g",
-        "ripe": "y",
-        "overripe": "r"
-    }
-
-    plt.figure(figsize=(5, 5))
-
-    for sample in all_data:
-        label = sample["label"]
-        feats = sample["features"]
-        mean_h = feats[0]
-        mean_s = feats[2]
-        c = colors.get(label, "b")
-        plt.scatter(mean_h, mean_s, c=c, label=label)
-
-        # annotate with filename (optional)
-        name = os.path.basename(sample["path"])
-        plt.annotate(name, (mean_h, mean_s), fontsize=8)
-
-    # Avoid duplicate legend entries
-    handles, labels = plt.gca().get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    plt.legend(by_label.values(), by_label.keys())
-
-    plt.xlabel("Mean Hue")
-    plt.ylabel("Mean Saturation")
-    plt.title("Feature Space: Mean Hue vs Mean Saturation")
-    plt.tight_layout()
-
-    out_path = os.path.join("outputs", "feature_scatter.png")
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-    print(f"Saved feature scatter plot to {out_path}")
+    print(f"Saved confusion matrix → {out_path}")
 
 
 
-# -------------------------
-# 6. Main
-# -------------------------
+# -----------------------------------------------------------
+# 6. MAIN PROGRAM — WITH TRAIN/TEST SPLIT
+# -----------------------------------------------------------
 def main():
-    dataset_root = "dataset"
+    train_root = "dataset"
+    test_root = "testset"
 
-    all_features = []
-    all_labels = []
-    all_data = []
+    # ------------ TRAINING DATA -------------------
+    train_features = []
+    train_labels = []
+    pyramid_saved = {}
 
-    class_folders = [d for d in os.listdir(dataset_root)
-                     if os.path.isdir(os.path.join(dataset_root, d))]
-    class_folders.sort()
-    print("Classes found:", class_folders)
+    class_names = sorted(os.listdir(train_root))
 
-    for label in class_folders:
-        folder_path = os.path.join(dataset_root, label)
+    print("Training on classes:", class_names)
 
-        for fname in os.listdir(folder_path):
+    for label in class_names:
+        class_dir = os.path.join(train_root, label)
+        if not os.path.isdir(class_dir):
+            continue
+
+        for fname in os.listdir(class_dir):
             if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
                 continue
 
-            img_path = os.path.join(folder_path, fname)
+            img_path = os.path.join(class_dir, fname)
             bgr = cv2.imread(img_path)
             if bgr is None:
-                print("Could not read:", img_path)
                 continue
 
-            save_steps = (len(all_data) == 0)
+            # Preprocess
+            _, _, hsv_after, pre = preprocess_image(bgr)
 
-            bgr_resized, hsv_before, hsv_after, bgr_preprocessed = preprocess_image(
-                bgr,
-                save_debug=save_steps,
-                label=label  # example: "ripe" or "unripe"
-            )
-            feats = extract_features(hsv_after)
+            # Gaussian pyramid
+            pyr = gaussian_pyramid(pre)
 
-            all_features.append(feats)
-            all_labels.append(label)
-            all_data.append({
-                "path": img_path,
-                "label": label,
-                "bgr_orig": bgr_resized,
-                "bgr_prep": bgr_preprocessed,
-                "hsv_before": hsv_before,
-                "hsv_after": hsv_after,
-                "features": feats
-            })
+            # Save 1 combined pyramid panel PER class
+            if label not in pyramid_saved:
+                combine_pyramid_images(pyr, f"outputs/{label}_pyramid_panel.png")
+                pyramid_saved[label] = True
 
-    all_features = np.vstack(all_features)
-    all_labels = np.array(all_labels)
+            # Extract features
+            color = extract_hsv_features(hsv_after)
+            texture = extract_texture_features(pyr)
+            full_feat = np.concatenate([color, texture])
 
-    print("Feature matrix shape:", all_features.shape)
+            train_features.append(full_feat)
+            train_labels.append(label)
 
-    print("\n=== Classification using 1-NN on HSV features ===")
-    for sample in all_data:
-        feat = sample["features"]
-        true_label = sample["label"]
-        predicted = classify_nearest(feat, all_features, all_labels)
-        print(f"{os.path.basename(sample['path'])}: true = {true_label}, predicted = {predicted}")
+    train_features = np.vstack(train_features)
+    train_labels = np.array(train_labels)
 
-    # Use the first image for PSNR/SSIM and plots
-    example = all_data[0]
-    orig_gray = cv2.cvtColor(example["bgr_orig"], cv2.COLOR_BGR2GRAY)
-    prep_gray = cv2.cvtColor(example["bgr_prep"], cv2.COLOR_BGR2GRAY)
+    print("Training samples loaded:", len(train_labels))
 
-    psnr_value = compute_psnr(orig_gray, prep_gray)
-    ssim_value = structural_similarity(orig_gray, prep_gray, data_range=255)
 
-    print("\n=== Quality metrics (original vs preprocessed) ===")
-    print(f"PSNR: {psnr_value:.3f} dB")
-    print(f"SSIM: {ssim_value:.3f}")
+    # ------------ TESTING DATA -------------------
+    y_true = []
+    y_pred = []
 
-    predicted_label = classify_nearest(example["features"], all_features, all_labels)
-    show_images(example["bgr_orig"], example["bgr_prep"],
-                true_label=example["label"],
-                predicted_label=predicted_label)
+    print("\nTesting classifier...")
 
-    show_histograms(example["hsv_before"], example["hsv_after"],
-                    title_prefix=example["label"].capitalize())
-    
-    plot_feature_bars(all_data)
-    plot_feature_scatter(all_data)
+    for label in class_names:
+        class_dir = os.path.join(test_root, label)
+        if not os.path.isdir(class_dir):
+            continue
 
+        for fname in os.listdir(class_dir):
+            if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue
+
+            img_path = os.path.join(class_dir, fname)
+            bgr = cv2.imread(img_path)
+            if bgr is None:
+                continue
+
+            y_true.append(label)
+
+            _, _, hsv_after, pre = preprocess_image(bgr)
+            pyr = gaussian_pyramid(pre)
+
+            color = extract_hsv_features(hsv_after)
+            texture = extract_texture_features(pyr)
+            feat = np.concatenate([color, texture])
+
+            pred = classify_nearest(feat, train_features, train_labels)
+            y_pred.append(pred)
+
+            print(f"{fname}: true={label}, predicted={pred}")
+
+
+    # ------------ METRICS -------------------
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    overall_acc = np.mean(y_true == y_pred)
+    print("\n==============================")
+    print("     RIPENESS ACCURACY REPORT")
+    print("==============================")
+    print(f"Overall Accuracy: {overall_acc * 100:.2f}%\n")
+
+    # Per-class accuracy
+    for cls in class_names:
+        idx = (y_true == cls)
+        cls_acc = np.mean(y_pred[idx] == cls)
+        print(f"{cls} accuracy: {cls_acc * 100:.2f}%")
+
+    # Confusion matrix
+    save_confusion_matrix(y_true, y_pred, class_names)
 
 
 
