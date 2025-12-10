@@ -2,34 +2,30 @@ import os
 import cv2
 import numpy as np
 
-# Use a non-GUI backend
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from skimage.metrics import structural_similarity
 from sklearn.metrics import confusion_matrix
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import KNeighborsClassifier
 import seaborn as sns
 
 
-
-# -----------------------------------------------------------
-# 1. PREPROCESSING
-# -----------------------------------------------------------
+#processes the images correctly
 def preprocess_image(bgr_img, save_debug=False, label="image"):
     """Resize → Gaussian blur → HSV → CLAHE."""
     os.makedirs("outputs", exist_ok=True)
 
-    # Resize
+    #resize image
     bgr_resized = cv2.resize(bgr_img, (256, 256))
 
-    # Gaussian smoothing
+    #gaussian smoothing
     bgr_gaussian = cv2.GaussianBlur(bgr_resized, (5, 5), 0)
 
-    # HSV conversion
+    #HSV conversion
     hsv_before = cv2.cvtColor(bgr_gaussian, cv2.COLOR_BGR2HSV)
-
-    # CLAHE on V channel
     h, s, v = cv2.split(hsv_before)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     v_eq = clahe.apply(v)
@@ -39,10 +35,7 @@ def preprocess_image(bgr_img, save_debug=False, label="image"):
     return bgr_resized, hsv_before, hsv_after, bgr_preprocessed
 
 
-
-# -----------------------------------------------------------
-# 2. GAUSSIAN PYRAMID + TEXTURE FEATURES
-# -----------------------------------------------------------
+#Gaussian Pyramid
 def gaussian_pyramid(img, levels=4):
     pyr = [img]
     temp = img.copy()
@@ -66,38 +59,66 @@ def laplacian_sharpness(img):
     return lap.var()
 
 
-
-# -----------------------------------------------------------
-# 3. FEATURE EXTRACTION
-# -----------------------------------------------------------
+#Extracts the hsv features from the fruit
 def extract_hsv_features(hsv_img):
+    """
+    Color features:
+      - mean / std of H, S, V
+      - percentage of pixels in 3 hue ranges:
+        * greenish
+        * yellowish
+        * brownish
+    Uses a mask to ignore low-saturation / low-value background.
+    """
     h, s, v = cv2.split(hsv_img)
+
+    #focus the mask of the fruit on the image
+    mask = (s > 40) & (v > 40)
+    if np.sum(mask) < 50:
+        h_valid = h.flatten()
+        s_valid = s.flatten()
+        v_valid = v.flatten()
+    else:
+        h_valid = h[mask]
+        s_valid = s[mask]
+        v_valid = v[mask]
+
+    mean_h = np.mean(h_valid)
+    std_h  = np.std(h_valid)
+    mean_s = np.mean(s_valid)
+    std_s  = np.std(s_valid)
+    mean_v = np.mean(v_valid)
+    std_v  = np.std(v_valid)
+
+    #Hue percentages displayed
+    total_pix = len(h_valid) + 1e-8
+
+    #ranges for the fruit used (banana) set at these values, dpending on the hue and fruit
+    yellow_mask = (h_valid >= 15) & (h_valid <= 35)
+    green_mask  = (h_valid >= 35) & (h_valid <= 85)
+    brown_mask  = (h_valid < 15) | (h_valid > 85)
+
+    frac_yellow = np.sum(yellow_mask) / total_pix
+    frac_green  = np.sum(green_mask) / total_pix
+    frac_brown  = np.sum(brown_mask) / total_pix
+
     return np.array([
-        np.mean(h), np.std(h),
-        np.mean(s), np.std(s),
-        np.mean(v), np.std(v),
+        mean_h, std_h,
+        mean_s, std_s,
+        mean_v, std_v,
+        frac_green, frac_yellow, frac_brown
     ], dtype=np.float32)
 
 
 def extract_texture_features(pyr):
     sharp = [laplacian_sharpness(level) for level in pyr]
-    decay = sharp[0] - sharp[-1]  # how fast texture disappears
+    decay = sharp[0] - sharp[-1]
+    while len(sharp) < 4:
+        sharp.append(0.0)
     return np.array([sharp[0], sharp[1], sharp[2], sharp[3], decay], dtype=np.float32)
 
 
-
-# -----------------------------------------------------------
-# 4. CLASSIFIER
-# -----------------------------------------------------------
-def classify_nearest(feat, all_features, labels):
-    d = np.linalg.norm(all_features - feat, axis=1)
-    return labels[np.argmin(d)]
-
-
-
-# -----------------------------------------------------------
-# 5. CONFUSION MATRIX PLOTTING
-# -----------------------------------------------------------
+#Confusion Matrix displaying correct information
 def save_confusion_matrix(y_true, y_pred, class_names, out_path="outputs/confusion_matrix.png"):
     cm = confusion_matrix(y_true, y_pred, labels=class_names)
 
@@ -113,20 +134,20 @@ def save_confusion_matrix(y_true, y_pred, class_names, out_path="outputs/confusi
     print(f"Saved confusion matrix → {out_path}")
 
 
-
-# -----------------------------------------------------------
-# 6. MAIN PROGRAM — WITH TRAIN/TEST SPLIT
-# -----------------------------------------------------------
+#main function that runs the program
 def main():
     train_root = "dataset"
     test_root = "testset"
 
-    # ------------ TRAINING DATA -------------------
+    #training data
     train_features = []
     train_labels = []
     pyramid_saved = {}
 
-    class_names = sorted(os.listdir(train_root))
+    class_names = sorted([
+        d for d in os.listdir(train_root)
+        if os.path.isdir(os.path.join(train_root, d))
+    ])
 
     print("Training on classes:", class_names)
 
@@ -144,18 +165,16 @@ def main():
             if bgr is None:
                 continue
 
-            # Preprocess
+            #Preprocess image
             _, _, hsv_after, pre = preprocess_image(bgr)
 
-            # Gaussian pyramid
+            #Gaussian pyramid
             pyr = gaussian_pyramid(pre)
-
-            # Save 1 combined pyramid panel PER class
             if label not in pyramid_saved:
                 combine_pyramid_images(pyr, f"outputs/{label}_pyramid_panel.png")
                 pyramid_saved[label] = True
 
-            # Extract features
+            #Extract features from the images like color and texture
             color = extract_hsv_features(hsv_after)
             texture = extract_texture_features(pyr)
             full_feat = np.concatenate([color, texture])
@@ -168,8 +187,14 @@ def main():
 
     print("Training samples loaded:", len(train_labels))
 
+    #scaling the data and fitting the model
+    scaler = StandardScaler()
+    train_features_scaled = scaler.fit_transform(train_features)
 
-    # ------------ TESTING DATA -------------------
+    clf = KNeighborsClassifier(n_neighbors=3)
+    clf.fit(train_features_scaled, train_labels)
+
+    #testing data for making predictions
     y_true = []
     y_pred = []
 
@@ -197,33 +222,32 @@ def main():
             color = extract_hsv_features(hsv_after)
             texture = extract_texture_features(pyr)
             feat = np.concatenate([color, texture])
-
-            pred = classify_nearest(feat, train_features, train_labels)
+            feat_scaled = scaler.transform(feat.reshape(1, -1))
+            pred = clf.predict(feat_scaled)[0]
             y_pred.append(pred)
 
             print(f"{fname}: true={label}, predicted={pred}")
 
-
-    # ------------ METRICS -------------------
+    #set for the accuracy report, what would show in the terminal
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
 
     overall_acc = np.mean(y_true == y_pred)
-    print("\n==============================")
-    print("     RIPENESS ACCURACY REPORT")
-    print("==============================")
-    print(f"Overall Accuracy: {overall_acc * 100:.2f}%\n")
+    print("\n========RIPENESS ACCURACY REPORT========")
+    print(f"    ====Overall Accuracy: {overall_acc * 100:.2f}%====\n")
 
-    # Per-class accuracy
+    #accuracy set for the classes
     for cls in class_names:
         idx = (y_true == cls)
+        if np.sum(idx) == 0:
+            continue
         cls_acc = np.mean(y_pred[idx] == cls)
         print(f"{cls} accuracy: {cls_acc * 100:.2f}%")
 
-    # Confusion matrix
+    #saves the confusion matrix in our outputs folder
     save_confusion_matrix(y_true, y_pred, class_names)
-
 
 
 if __name__ == "__main__":
     main()
+
